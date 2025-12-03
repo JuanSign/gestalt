@@ -30,6 +30,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 const UI_TICK_RATE: Duration = Duration::from_millis(100);
 const UI_UPDATE_THRESHOLD_BYTES: u64 = 512 * 1024;
+const UI_UPDATE_INTERVAL_MS: u128 = 100;
 
 #[derive(Debug)]
 pub enum ServerUiEvent {
@@ -199,6 +200,7 @@ impl CortexService for MyCortexService {
         file.seek(std::io::SeekFrom::Start(metadata.offset)).await?;
 
         let mut bytes_since_update = 0;
+        let mut last_ui_update = Instant::now();
 
         while let Some(msg) = stream.message().await? {
             if let Some(upload_part_request::Data::Content(bytes)) = msg.data {
@@ -207,13 +209,16 @@ impl CortexService for MyCortexService {
                 let len = bytes.len() as u64;
                 bytes_since_update += len;
 
-                if bytes_since_update >= UI_UPDATE_THRESHOLD_BYTES {
+                if bytes_since_update >= UI_UPDATE_THRESHOLD_BYTES
+                    && last_ui_update.elapsed().as_millis() >= UI_UPDATE_INTERVAL_MS
+                {
                     self.emit(ServerUiEvent::PartProgress {
                         file_id: metadata.upload_id.clone(),
                         part_id: part_stream_id.clone(),
                         added: bytes_since_update,
                     });
                     bytes_since_update = 0;
+                    last_ui_update = Instant::now();
                 }
             }
         }
@@ -299,6 +304,7 @@ impl CortexService for MyCortexService {
             let mut reader = BufReader::with_capacity(64 * 1024, file);
             let mut buffer = vec![0u8; 32 * 1024];
             let mut bytes_since_update = 0;
+            let mut last_ui_update = Instant::now();
 
             loop {
                 match reader.read(&mut buffer).await {
@@ -315,13 +321,16 @@ impl CortexService for MyCortexService {
                         }
 
                         bytes_since_update += n as u64;
-                        if bytes_since_update >= UI_UPDATE_THRESHOLD_BYTES {
+                        if bytes_since_update >= UI_UPDATE_THRESHOLD_BYTES
+                            && last_ui_update.elapsed().as_millis() >= UI_UPDATE_INTERVAL_MS
+                        {
                             let _ = ui_tx.try_send(ServerUiEvent::PartProgress {
                                 file_id: download_id.clone(),
                                 part_id: part_id.clone(),
                                 added: bytes_since_update,
                             });
                             bytes_since_update = 0;
+                            last_ui_update = Instant::now();
                         }
                     }
                     Err(_) => break,
@@ -480,7 +489,7 @@ pub async fn run_server(addr: String, storage: String) -> anyhow::Result<()> {
 
     let mut app = ServerApp {
         input: String::new(),
-        logs: vec!["Server listening...".into()],
+        logs: vec!["[SYSTEM] Cortex server ready.".into()],
         transfers: HashMap::new(),
         clients: Vec::new(),
     };
@@ -588,16 +597,49 @@ fn process_event(app: &mut ServerApp, event: ServerUiEvent, clients: &ClientMap)
         ServerUiEvent::Submit => {
             let cmd = app.input.drain(..).collect::<String>();
             let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
-            if !parts.is_empty() && parts[0] == "bc" {
-                let text = parts[1..].join(" ");
-                let map = clients.lock().unwrap();
-                for tx in map.values() {
-                    let _ = tx.try_send(Ok(ServerMessage {
-                        sender: "SERVER".into(),
-                        text: text.clone(),
-                    }));
+
+            if parts.is_empty() {
+                return;
+            }
+
+            match parts[0] {
+                "bc" => {
+                    if parts.len() < 2 {
+                        app.logs.push("Usage: bc <message>".into());
+                    } else {
+                        let text = parts[1..].join(" ");
+                        let map = clients.lock().unwrap();
+                        for tx in map.values() {
+                            let _ = tx.try_send(Ok(ServerMessage {
+                                sender: "SERVER".into(),
+                                text: text.clone(),
+                            }));
+                        }
+                        app.logs.push(format!("Broadcast: {}", text));
+                    }
                 }
-                app.logs.push(format!("Broadcast: {}", text));
+                "msg" => {
+                    if parts.len() < 3 {
+                        app.logs.push("Usage: msg <client_id> <message>".into());
+                    } else {
+                        let target_id = parts[1];
+                        let text = parts[2..].join(" ");
+                        let map = clients.lock().unwrap();
+
+                        if let Some(tx) = map.get(target_id) {
+                            let _ = tx.try_send(Ok(ServerMessage {
+                                sender: "SERVER (Private)".into(),
+                                text: text.clone(),
+                            }));
+                            app.logs.push(format!("To {}: {}", target_id, text));
+                        } else {
+                            app.logs.push(format!("Client {} not found", target_id));
+                        }
+                    }
+                }
+                _ => {
+                    app.logs.push(format!("Unknown command: {}", parts[0]));
+                }
             }
         }
         ServerUiEvent::Tick => {

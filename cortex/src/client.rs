@@ -8,6 +8,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::{stream, StreamExt};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -31,6 +32,7 @@ const PART_SIZE: u64 = 5 * 1024 * 1024;
 const CHUNK_SIZE: usize = 32 * 1024;
 const MAX_CONCURRENT_TASKS: usize = 5;
 const UI_UPDATE_THRESHOLD_BYTES: u64 = 256 * 1024;
+const UI_UPDATE_INTERVAL_MS: u128 = 100;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -94,7 +96,7 @@ impl App {
         Self {
             input: String::new(),
             messages: vec![
-                "[SYSTEM] Cortex Client Ready. Type 'upload <file>' or 'download <file>'".into(),
+                "[SYSTEM] Cortex Client Ready.".into(),
             ],
             transfers: HashMap::new(),
         }
@@ -531,63 +533,62 @@ async fn multipart_upload(
         .into_inner();
     let upload_id = init_resp.upload_id;
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS));
     let path_arc = Arc::new(path_str);
-    let mut tasks = vec![];
-    let mut current_offset = 0;
+    let part_offsets: Vec<u64> = (0..total_size).step_by(PART_SIZE as usize).collect();
 
-    while current_offset < total_size {
-        let length = std::cmp::min(PART_SIZE, total_size - current_offset);
-        let offset = current_offset;
+    let uploads = stream::iter(part_offsets)
+        .map(|offset| {
+            let length = std::cmp::min(PART_SIZE, total_size - offset);
+            let c = client.clone();
+            let p = path_arc.clone();
+            let u = upload_id.clone();
+            let t_ui = tx.clone();
+            let f_id = file_id.clone();
 
-        let sem = semaphore.clone();
-        let c = client.clone();
-        let p = path_arc.clone();
-        let u = upload_id.clone();
-        let t_ui = tx.clone();
-        let f_id = file_id.clone();
+            async move {
+                let part_id = uuid::Uuid::new_v4().to_string();
+                let _ = t_ui
+                    .send(AppEvent::PartStart {
+                        file_id: f_id.clone(),
+                        part_id: part_id.clone(),
+                        offset,
+                        total: length,
+                    })
+                    .await;
 
-        let task = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let part_id = uuid::Uuid::new_v4().to_string();
-
-            let _ = t_ui
-                .send(AppEvent::PartStart {
-                    file_id: f_id.clone(),
-                    part_id: part_id.clone(),
+                let res = upload_part(
+                    c,
+                    p,
+                    u,
                     offset,
-                    total: length,
-                })
+                    length,
+                    t_ui.clone(),
+                    f_id.clone(),
+                    part_id.clone(),
+                )
                 .await;
 
-            let res = upload_part(
-                c,
-                p,
-                u,
-                offset,
-                length,
-                t_ui.clone(),
-                f_id.clone(),
-                part_id.clone(),
-            )
-            .await;
+                let _ = t_ui
+                    .send(AppEvent::PartComplete {
+                        file_id: f_id,
+                        part_id,
+                    })
+                    .await;
+                res
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_TASKS);
 
-            let _ = t_ui
-                .send(AppEvent::PartComplete {
-                    file_id: f_id,
-                    part_id,
-                })
-                .await;
-            res
-        });
-
-        tasks.push(task);
-        current_offset += length;
-    }
-
-    for task in tasks {
-        task.await??;
-    }
+    uploads
+        .for_each(|res| async {
+            if let Err(e) = res {
+                let _ = tx
+                    .clone()
+                    .send(AppEvent::Log(format!("[Part Err]: {}", e)))
+                    .await;
+            }
+        })
+        .await;
 
     client
         .complete_upload(Request::new(CompleteRequest {
@@ -623,22 +624,27 @@ async fn upload_part(
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut sent = 0;
         let mut bytes_since_ui = 0;
+        let mut last_ui_update = Instant::now();
 
         while sent < length {
             let to_read = std::cmp::min(CHUNK_SIZE as u64, length - sent) as usize;
-            let n = file.read(&mut buffer[0..to_read]).await.unwrap();
-            if n == 0 { break; }
+            match file.read(&mut buffer[0..to_read]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes_since_ui += n as u64;
+                    if bytes_since_ui >= UI_UPDATE_THRESHOLD_BYTES && last_ui_update.elapsed().as_millis() >= UI_UPDATE_INTERVAL_MS {
+                         let _ = tx.try_send(AppEvent::PartProgress {
+                            file_id: file_id.clone(), part_id: part_id.clone(), added: bytes_since_ui
+                        });
+                        bytes_since_ui = 0;
+                        last_ui_update = Instant::now();
+                    }
 
-            bytes_since_ui += n as u64;
-            if bytes_since_ui >= UI_UPDATE_THRESHOLD_BYTES {
-                 let _ = tx.try_send(AppEvent::PartProgress {
-                    file_id: file_id.clone(), part_id: part_id.clone(), added: bytes_since_ui
-                });
-                bytes_since_ui = 0;
+                    yield UploadPartRequest { data: Some(upload_part_request::Data::Content(buffer[0..n].to_vec())) };
+                    sent += n as u64;
+                },
+                Err(_) => break,
             }
-
-            yield UploadPartRequest { data: Some(upload_part_request::Data::Content(buffer[0..n].to_vec())) };
-            sent += n as u64;
         }
         if bytes_since_ui > 0 {
              let _ = tx.try_send(AppEvent::PartProgress {
@@ -682,90 +688,103 @@ async fn multipart_download(
     f.set_len(total_size).await?;
     drop(f);
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TASKS));
     let path_arc = Arc::new(local_path);
-    let mut tasks = vec![];
-    let mut current_offset = 0;
+    let part_offsets: Vec<u64> = (0..total_size).step_by(PART_SIZE as usize).collect();
 
-    while current_offset < total_size {
-        let length = std::cmp::min(PART_SIZE, total_size - current_offset);
-        let offset = current_offset;
+    let downloads = stream::iter(part_offsets)
+        .map(|offset| {
+            let length = std::cmp::min(PART_SIZE, total_size - offset);
+            let mut c = client.clone();
+            let p = path_arc.clone();
+            let t_ui = tx.clone();
+            let f_id = file_id.clone();
+            let f_name = fname.clone();
 
-        let sem = semaphore.clone();
-        let mut c = client.clone();
-        let p = path_arc.clone();
-        let t_ui = tx.clone();
-        let f_id = file_id.clone();
-        let f_name = fname.clone();
-
-        let task = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let part_id = uuid::Uuid::new_v4().to_string();
-
-            let _ = t_ui
-                .send(AppEvent::PartStart {
-                    file_id: f_id.clone(),
-                    part_id: part_id.clone(),
-                    offset,
-                    total: length,
-                })
-                .await;
-
-            let req = Request::new(DownloadPartRequest {
-                file_name: f_name,
-                offset,
-                length,
-            });
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open(p.as_str())
-                .await
-                .unwrap();
-            file.seek(std::io::SeekFrom::Start(offset)).await.unwrap();
-
-            if let Ok(response) = c.download_part(req).await {
-                let mut stream = response.into_inner();
-                let mut bytes_since_ui = 0;
-
-                while let Some(chunk) = stream.message().await.unwrap() {
-                    file.write_all(&chunk.content).await.unwrap();
-                    let len = chunk.content.len() as u64;
-                    bytes_since_ui += len;
-
-                    if bytes_since_ui >= UI_UPDATE_THRESHOLD_BYTES {
-                        let _ = t_ui.try_send(AppEvent::PartProgress {
-                            file_id: f_id.clone(),
-                            part_id: part_id.clone(),
-                            added: bytes_since_ui,
-                        });
-                        bytes_since_ui = 0;
-                    }
-                }
-                if bytes_since_ui > 0 {
-                    let _ = t_ui.try_send(AppEvent::PartProgress {
+            async move {
+                let part_id = uuid::Uuid::new_v4().to_string();
+                let _ = t_ui
+                    .send(AppEvent::PartStart {
                         file_id: f_id.clone(),
                         part_id: part_id.clone(),
-                        added: bytes_since_ui,
-                    });
+                        offset,
+                        total: length,
+                    })
+                    .await;
+
+                let req = Request::new(DownloadPartRequest {
+                    file_name: f_name,
+                    offset,
+                    length,
+                });
+
+                let mut result = Ok(());
+
+                match OpenOptions::new().write(true).open(p.as_str()).await {
+                    Ok(mut file) => {
+                        if let Err(_) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                            return Err(anyhow::anyhow!("Seek failed"));
+                        }
+
+                        if let Ok(response) = c.download_part(req).await {
+                            let mut stream = response.into_inner();
+                            let mut bytes_since_ui = 0;
+                            let mut last_ui_update = Instant::now();
+
+                            while let Ok(Some(chunk)) = stream.message().await {
+                                if file.write_all(&chunk.content).await.is_err() {
+                                    result = Err(anyhow::anyhow!("Write failed"));
+                                    break;
+                                }
+                                let len = chunk.content.len() as u64;
+                                bytes_since_ui += len;
+
+                                if bytes_since_ui >= UI_UPDATE_THRESHOLD_BYTES
+                                    && last_ui_update.elapsed().as_millis() >= UI_UPDATE_INTERVAL_MS
+                                {
+                                    let _ = t_ui.try_send(AppEvent::PartProgress {
+                                        file_id: f_id.clone(),
+                                        part_id: part_id.clone(),
+                                        added: bytes_since_ui,
+                                    });
+                                    bytes_since_ui = 0;
+                                    last_ui_update = Instant::now();
+                                }
+                            }
+                            if bytes_since_ui > 0 {
+                                let _ = t_ui.try_send(AppEvent::PartProgress {
+                                    file_id: f_id.clone(),
+                                    part_id: part_id.clone(),
+                                    added: bytes_since_ui,
+                                });
+                            }
+                        } else {
+                            result = Err(anyhow::anyhow!("RPC failed"));
+                        }
+                    }
+                    Err(_) => result = Err(anyhow::anyhow!("File open failed")),
                 }
+
+                let _ = t_ui
+                    .send(AppEvent::PartComplete {
+                        file_id: f_id,
+                        part_id,
+                    })
+                    .await;
+                result
             }
+        })
+        .buffer_unordered(MAX_CONCURRENT_TASKS);
 
-            let _ = t_ui
-                .send(AppEvent::PartComplete {
-                    file_id: f_id,
-                    part_id,
-                })
-                .await;
-        });
-
-        tasks.push(task);
-        current_offset += length;
-    }
-
-    for task in tasks {
-        task.await?;
-    }
+    downloads
+        .for_each(|res| async {
+            if let Err(e) = res {
+                let _ = tx
+                    .clone()
+                    .send(AppEvent::Log(format!("[Download Err]: {}", e)))
+                    .await;
+            }
+        })
+        .await;
 
     tx.send(AppEvent::TransferComplete { id: file_id }).await?;
     Ok(())
