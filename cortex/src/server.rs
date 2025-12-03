@@ -1,84 +1,120 @@
 use crate::pb::cortex::cortex_service_server::CortexService;
-use crate::pb::cortex::{ClientMessage, FileChunk, FileRequest, ServerResponse, TransferStatus};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::path::Path;
-use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use crate::pb::cortex::{
+    upload_part_request, ClientMessage, CompleteRequest, ConnectRequest, FileChunk, FileRequest,
+    ServerMessage, ServerResponse, TransferStatus, UploadId, UploadPartRequest,
+};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::info;
 
+type ClientMap = Arc<Mutex<HashMap<String, mpsc::Sender<Result<ServerMessage, Status>>>>>;
+
+#[derive(Debug)]
 pub struct ServerState {
-    pub multi_bar: MultiProgress,
+    pub storage_dir: String,
+    pub clients: ClientMap,
 }
 
 pub struct MyCortexService {
     pub state: Arc<ServerState>,
-    pub storage_dir: String,
+}
+
+impl MyCortexService {
+    fn get_safe_path(&self, filename: &str) -> Result<PathBuf, Status> {
+        let clean_name = Path::new(filename)
+            .file_name()
+            .ok_or_else(|| Status::invalid_argument("Invalid filename"))?
+            .to_string_lossy();
+
+        if clean_name.is_empty() || clean_name.contains("..") {
+            return Err(Status::invalid_argument("Invalid filename security check"));
+        }
+        Ok(Path::new(&self.state.storage_dir).join(clean_name.as_ref()))
+    }
 }
 
 #[tonic::async_trait]
 impl CortexService for MyCortexService {
     type DownloadFileStream = ReceiverStream<Result<FileChunk, Status>>;
+    type SubscribeMessagesStream = ReceiverStream<Result<ServerMessage, Status>>;
 
-    async fn upload_file(
+    async fn initiate_upload(
         &self,
-        request: Request<Streaming<FileChunk>>,
+        request: Request<FileRequest>,
+    ) -> Result<Response<UploadId>, Status> {
+        let req = request.into_inner();
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        let path = self.get_safe_path(&upload_id)?;
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let file = File::create(&path).await?;
+        file.set_len(req.total_size).await?;
+        info!("Initiated upload: {}", upload_id);
+
+        Ok(Response::new(UploadId { upload_id }))
+    }
+
+    async fn upload_part(
+        &self,
+        request: Request<Streaming<UploadPartRequest>>,
     ) -> Result<Response<TransferStatus>, Status> {
         let mut stream = request.into_inner();
-        let storage_dir = self.storage_dir.clone();
-        let mb = self.state.multi_bar.clone();
 
-        let pb = mb.add(ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message("Receiving Upload...");
+        let metadata = match stream.message().await? {
+            Some(msg) => match msg.data {
+                Some(upload_part_request::Data::Metadata(m)) => m,
+                _ => return Err(Status::invalid_argument("Metadata missing")),
+            },
+            None => return Err(Status::invalid_argument("Empty stream")),
+        };
 
-        let mut file: Option<BufWriter<File>> = None;
-        let mut file_name = String::new();
-
-        while let Some(chunk_result) = stream.message().await? {
-            let chunk = chunk_result;
-
-            if file.is_none() {
-                file_name = chunk.file_name.clone();
-                let path = Path::new(&storage_dir).join(&file_name);
-
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-
-                let f = File::create(path).await?;
-                file = Some(BufWriter::new(f));
-
-                if chunk.total_size > 0 {
-                    pb.set_length(chunk.total_size);
-                }
-                pb.set_message(format!("Receiving: {}", file_name));
-            }
-
-            if let Some(ref mut f) = file {
-                f.write_all(&chunk.content).await?;
-                pb.inc(chunk.content.len() as u64);
-            }
+        let path = self.get_safe_path(&metadata.upload_id)?;
+        if !path.exists() {
+            return Err(Status::not_found("Upload ID not found"));
         }
 
-        if let Some(mut f) = file {
-            f.flush().await?;
-        }
+        let mut file = OpenOptions::new().write(true).open(&path).await?;
+        file.seek(std::io::SeekFrom::Start(metadata.offset)).await?;
 
-        pb.finish_with_message(format!("Saved: {}", file_name));
+        let mut bytes_written = 0;
+        while let Some(msg) = stream.message().await? {
+            if let Some(upload_part_request::Data::Content(bytes)) = msg.data {
+                file.write_all(&bytes).await?;
+                bytes_written += bytes.len();
+            }
+        }
 
         Ok(Response::new(TransferStatus {
-            message: format!("Upload of {} complete", file_name),
+            message: format!("Written {}", bytes_written),
+            success: true,
+        }))
+    }
+
+    async fn complete_upload(
+        &self,
+        request: Request<CompleteRequest>,
+    ) -> Result<Response<TransferStatus>, Status> {
+        let req = request.into_inner();
+        let temp_path = self.get_safe_path(&req.upload_id)?;
+        let final_path = self.get_safe_path(&req.final_filename)?;
+
+        if !temp_path.exists() {
+            return Err(Status::not_found("Upload ID not found"));
+        }
+        tokio::fs::rename(temp_path, &final_path).await?;
+        info!("Upload completed: {:?}", final_path);
+
+        Ok(Response::new(TransferStatus {
+            message: "Success".into(),
             success: true,
         }))
     }
@@ -88,62 +124,32 @@ impl CortexService for MyCortexService {
         request: Request<FileRequest>,
     ) -> Result<Response<Self::DownloadFileStream>, Status> {
         let req = request.into_inner();
-        let path = Path::new(&self.storage_dir).join(&req.file_name);
-
-        if !path.exists() {
-            return Err(Status::not_found("File not found on server"));
-        }
+        let path = self.get_safe_path(&req.file_name)?;
 
         let file = File::open(&path).await?;
-        let metadata = file.metadata().await?;
-        let total_size = metadata.len();
-
-        let mb = self.state.multi_bar.clone();
-        let pb = mb.add(ProgressBar::new(total_size));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{msg} [{bar:40.green/white}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message(format!("Sending: {}", req.file_name));
-
         let (tx, rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
             let mut reader = tokio::io::BufReader::new(file);
-
-            let mut buffer = vec![0u8; 1024 * 64];
-
-            let mut first = true;
+            let mut buffer = vec![0u8; 64 * 1024];
 
             loop {
-                let n = match reader.read(&mut buffer).await {
-                    Ok(n) if n == 0 => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("Error reading file: {}", e);
-                        break;
+                match reader.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx
+                            .send(Ok(FileChunk {
+                                content: buffer[..n].to_vec(),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                };
-
-                let chunk = FileChunk {
-                    file_name: req.file_name.clone(),
-                    content: buffer[..n].to_vec(),
-                    total_size: if first { total_size } else { 0 },
-                };
-                first = false;
-
-                if tx.send(Ok(chunk)).await.is_err() {
-                    warn!("Client disconnected during download");
-                    break;
+                    Err(_) => break,
                 }
-
-                pb.inc(n as u64);
             }
-            pb.finish_with_message(format!("Sent: {}", req.file_name));
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -154,12 +160,22 @@ impl CortexService for MyCortexService {
         request: Request<ClientMessage>,
     ) -> Result<Response<ServerResponse>, Status> {
         let msg = request.into_inner();
-        self.state.multi_bar.suspend(|| {
-            info!("Message from {}: {}", msg.client_id, msg.text);
-        });
-
+        info!("Message from {}: {}", msg.client_id, msg.text);
         Ok(Response::new(ServerResponse {
-            text: "Message received".into(),
+            text: "Received".into(),
         }))
+    }
+
+    async fn subscribe_messages(
+        &self,
+        request: Request<ConnectRequest>,
+    ) -> Result<Response<Self::SubscribeMessagesStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = mpsc::channel(100);
+
+        info!("Client subscribed: {}", req.client_id);
+        self.state.clients.lock().unwrap().insert(req.client_id, tx);
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }

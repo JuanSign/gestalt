@@ -2,15 +2,34 @@ syntax = "proto3";
 package cortex;
 
 service CortexService {
-    rpc UploadFile (stream FileChunk) returns (TransferStatus);
+    rpc InitiateUpload (FileRequest) returns (UploadId);
+    rpc UploadPart (stream UploadPartRequest) returns (TransferStatus);
+    rpc CompleteUpload (CompleteRequest) returns (TransferStatus);
     rpc DownloadFile (FileRequest) returns (stream FileChunk);
     rpc SendMessage (ClientMessage) returns (ServerResponse);
+    rpc SubscribeMessages (ConnectRequest) returns (stream ServerMessage);
 }
 
-message FileChunk {
-    string file_name = 1;
-    bytes content = 2;
-    uint64 total_size = 3;
+message UploadId {
+    string upload_id = 1;
+}
+
+message UploadPartRequest {
+    oneof data {
+        PartMetadata metadata = 1;
+        bytes content = 2;
+    }
+}
+
+message PartMetadata {
+    string upload_id = 1;
+    uint64 offset = 2;
+    uint64 content_length = 3;
+}
+
+message CompleteRequest {
+    string upload_id = 1;
+    string final_filename = 2;
 }
 
 message TransferStatus {
@@ -20,6 +39,11 @@ message TransferStatus {
 
 message FileRequest {
     string file_name = 1;
+    uint64 total_size = 2;
+}
+
+message FileChunk {
+    bytes content = 1;
 }
 
 message ClientMessage {
@@ -28,5 +52,13 @@ message ClientMessage {
 }
 
 message ServerResponse {
+    string text = 1;
+}
+
+message ConnectRequest {
+    string client_id = 1;
+}
+
+message ServerMessage {
     string text = 1;
 }
