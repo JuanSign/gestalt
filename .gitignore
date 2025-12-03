@@ -1,0 +1,4 @@
+# Rust Generated Files
+cortex/target
+cortex/cortex_storage
+cortex/cortex_download
